@@ -10,12 +10,41 @@
 //! https://511.org/open-data/transit provides Capital Corridor as "CC". This data refreshes more often (and is closer in location & time), and shows locomotive numbers.
 //! For this reason, you may wish to remove Capital Corridor from this feed.
 //! Thus, we've included a function `filter_capital_corridor()` which takes in any `gtfs_rt::FeedMessage` and removes CC vehicles and trips.
+//!
+//!A valid Amtrak GTFS structure must be passed into the function to work.
+//!
+//!Here's an example of some working code! 
+//!Note that `prost` version `0.11` should be used, as `gtfs-rt` does not use `0.12` yet.
+//!```rust 
+//!extern crate amtrak_gtfs_rt;
+//!
+//!use prost::Message;
+//!use gtfs_structures::Gtfs;
 
+//!#[tokio::main]
+//!async fn main() {
+//!    let gtfs = Gtfs::from_url_async("https://content.amtrak.com/content/gtfs/GTFS.zip")
+//!    .await
+//!    .unwrap();
+//!
+//!    let client = reqwest::Client::new();
+//!    loop {
+//!        let amtrak_gtfs_rt = amtrak_gtfs_rt::fetch_amtrak_gtfs_rt(&gtfs, &client).await.unwrap();
+//!
+//!        //extract the binary data
+//!        let vehicle_data = amtrak_gtfs_rt.vehicle_positions.encode_to_vec();
+//!        let trip_data = amtrak_gtfs_rt.trip_updates.encode_to_vec();
+//!
+//!        std::thread::sleep(std::time::Duration::from_millis(500));
+//!    }
+//!}
+//!```
 
-use chrono::Datelike;
-use chrono::NaiveDate;
-use chrono::TimeZone;
-use chrono::Weekday;
+//!This software package decrypts the Amtrak track-a-train json data and performs lookups of trip information in the GTFS schedule to match each vehicle with it's route_id and trip_id.
+
+//!Pull requests are welcome!
+
+use chrono::{Datelike, NaiveDateTime, TimeZone, Weekday};
 use geojson::FeatureCollection;
 use gtfs_structures::Gtfs;
 use std::collections::HashMap;
@@ -76,7 +105,7 @@ pub struct AmtrakArrivalJson {
     //{"code":"CTL",
     code: String,
     //"tz":"P",
-    tz: String,
+    tz: char,
     //"bus":false,
     bus: bool,
     // "scharr":"12/11/2023 17:33:00",
@@ -102,7 +131,7 @@ pub struct AmtrakArrivalJson {
 fn feature_to_amtrak_arrival_structs(feature: &geojson::Feature) -> Vec<AmtrakArrivalJson> {
     let mut amtrak_arrival_jsons = vec![];
 
-    for i in 0 as i32..100 as i32 {
+    for i in 0i32..100i32 {
         let mut key = String::from("Station");
         key.push_str(&i.to_string());
 
@@ -157,13 +186,6 @@ fn get_bearing(feature: &geojson::Feature) -> Option<f32> {
     }
 }
 
-fn option_i32_to_i64(x: Option<i32>) -> Option<i64> {
-    match x {
-        Some(x) => Some(x as i64),
-        None => None,
-    }
-}
-
 pub fn feature_to_gtfs_unified(gtfs: &Gtfs, feature: &geojson::Feature) -> gtfs_rt::FeedEntity {
     let geometry = feature.geometry.as_ref().unwrap();
     let point: Option<geojson::PointType> = match geometry.value.clone() {
@@ -203,7 +225,7 @@ pub fn feature_to_gtfs_unified(gtfs: &Gtfs, feature: &geojson::Feature) -> gtfs_
                 arrival: match &feature.estarr {
                     Some(estarr) => Some(gtfs_rt::trip_update::StopTimeEvent {
                         delay: None,
-                        time: option_i32_to_i64(time_and_tz_to_unix(&estarr, &feature.tz)),
+                        time: Some(time_and_tz_to_unix(&estarr, feature.tz)),
                         uncertainty: None,
                     }),
                     None => None,
@@ -211,7 +233,7 @@ pub fn feature_to_gtfs_unified(gtfs: &Gtfs, feature: &geojson::Feature) -> gtfs_
                 departure: match &feature.estdep {
                     Some(estdep) => Some(gtfs_rt::trip_update::StopTimeEvent {
                         delay: None,
-                        time: option_i32_to_i64(time_and_tz_to_unix(&estdep, &feature.tz)),
+                        time: Some(time_and_tz_to_unix(&estdep, feature.tz)),
                         uncertainty: None,
                     }),
                     None => None,
@@ -243,7 +265,7 @@ pub fn feature_to_gtfs_unified(gtfs: &Gtfs, feature: &geojson::Feature) -> gtfs_
 
     let origin_tz = match feature.properties.as_ref().unwrap().get("OriginTZ") {
         Some(a) => match a {
-            serde_json::value::Value::String(x) => Some(x.clone()),
+            serde_json::value::Value::String(x) if x.len() == 1 => Some(x.chars().next().unwrap()),
             _ => None,
         },
         _ => None,
@@ -259,20 +281,20 @@ pub fn feature_to_gtfs_unified(gtfs: &Gtfs, feature: &geojson::Feature) -> gtfs_
     }
     .unwrap();
 
-    let origin_local_time = origin_departure(&origin_time_string, &origin_tz);
+    let origin_local_time = origin_departure(&origin_time_string, origin_tz);
 
     let origin_weekday = origin_local_time.weekday();
 
     let trip_id: Option<String> = match trip_name {
         Some(x) => {
-            let hashmapresults = trip_name_to_id_hashmap.get(&x);
+            let hashmap_results = trip_name_to_id_hashmap.get(&x);
 
-            match hashmapresults {
-                Some(hashmapresults) => {
-                    match hashmapresults.len() {
-                        1 => Some(hashmapresults[0].clone()),
+            match hashmap_results {
+                Some(hashmap_results) => {
+                    match hashmap_results.len() {
+                        1 => Some(hashmap_results[0].clone()),
                         _ => {
-                            let possible_results = hashmapresults
+                            let possible_results = hashmap_results
                                 .iter()
                                 .filter(|trip_id_candidate| {
                                     let trip = gtfs.trips.get(trip_id_candidate.clone()).unwrap();
@@ -335,8 +357,8 @@ pub fn feature_to_gtfs_unified(gtfs: &Gtfs, feature: &geojson::Feature) -> gtfs_
     let bearing: Option<f32> = get_bearing(feature);
 
     let trip_desc = gtfs_rt::TripDescriptor {
-        trip_id: trip_id,
-        route_id: route_id,
+        trip_id,
+        route_id,
         direction_id: None,
         start_time: None,
         start_date: None,
@@ -351,7 +373,7 @@ pub fn feature_to_gtfs_unified(gtfs: &Gtfs, feature: &geojson::Feature) -> gtfs_
         trip_update: Some(gtfs_rt::TripUpdate {
             vehicle: None,
             trip: trip_desc.clone(),
-            timestamp: timestamp,
+            timestamp,
             delay: None,
             stop_time_update: arrivals,
             trip_properties: None,
@@ -359,7 +381,7 @@ pub fn feature_to_gtfs_unified(gtfs: &Gtfs, feature: &geojson::Feature) -> gtfs_
         vehicle: Some(gtfs_rt::VehiclePosition {
             stop_id: None,
             current_status: None,
-            timestamp: timestamp,
+            timestamp,
             congestion_level: None,
             occupancy_status: None,
             occupancy_percentage: None,
@@ -368,9 +390,9 @@ pub fn feature_to_gtfs_unified(gtfs: &Gtfs, feature: &geojson::Feature) -> gtfs_
             vehicle: None,
             trip: Some(trip_desc.clone()),
             position: Some(gtfs_rt::Position {
-                speed: speed,
+                speed,
                 odometer: None,
-                bearing: bearing,
+                bearing,
                 latitude: point[1] as f32,
                 longitude: point[0] as f32,
             }),
@@ -391,102 +413,38 @@ pub fn make_gtfs_header() -> gtfs_rt::FeedHeader {
     }
 }
 
-fn convert_12_to_24_hour(hour: u8, pm: bool) -> u8 {
-    match pm {
-        false => match hour {
-            12 => 0,
-            _ => hour + 12,
-        },
-        true => match hour {
-            12 => 12,
-            _ => hour + 12
-        },
-    }
-}
-
-fn tz_str_to_tz(tz: &str) -> Option<chrono_tz::Tz> {
+fn tz_char_to_tz(tz: char) -> Option<chrono_tz::Tz> {
     match tz {
-        "E" => Some(chrono_tz::America::New_York),
-        "M" => Some(chrono_tz::America::Denver),
-        "P" => Some(chrono_tz::America::Los_Angeles),
-        "C" => Some(chrono_tz::America::Chicago),
-        "A" => Some(chrono_tz::America::Phoenix),
+        'E' => Some(chrono_tz::America::New_York),
+        'M' => Some(chrono_tz::America::Denver),
+        'P' => Some(chrono_tz::America::Los_Angeles),
+        'C' => Some(chrono_tz::America::Chicago),
+        'A' => Some(chrono_tz::America::Phoenix),
         _ => None,
     }
 }
 
 //for arrivals and departures, does not parse PM or AM.
-fn time_and_tz_to_unix(timestamp_text: &String, tz: &String) -> Option<i32> {
+fn time_and_tz_to_unix(timestamp_text: &String, tz: char) -> i64 {
     // tz: String like "P", "C", "M", or "E"
     //time: "12/11/2023 17:36:00"
-    let parts = timestamp_text.split(" ").collect::<Vec<&str>>();
+    let naive_dt = NaiveDateTime::parse_from_str(timestamp_text, "%m/%d/%Y %H:%M:%S").unwrap();
 
-    let date_parts = parts[0]
-        .split("/")
-        .map(|x| x.parse::<i32>().unwrap())
-        .collect::<Vec<i32>>();
-
-    let time_parts = parts[1]
-        .split(":")
-        .map(|x| x.parse::<u8>().unwrap())
-        .collect::<Vec<u8>>();
-
-    let native_dt = NaiveDate::from_ymd_opt(
-        date_parts[2],
-        date_parts[0].try_into().unwrap(),
-        date_parts[1].try_into().unwrap(),
-    )
-    .unwrap()
-    .and_hms_opt(
-        time_parts[0].into(),
-        time_parts[1].into(),
-        time_parts[2].into(),
-    )
-    .unwrap();
-
-    let local_time_representation = tz_str_to_tz(tz)
+    let local_time_representation = tz_char_to_tz(tz)
         .unwrap()
-        .from_local_datetime(&native_dt)
+        .from_local_datetime(&naive_dt)
         .unwrap();
 
-    Some(local_time_representation.timestamp().try_into().unwrap())
+    local_time_representation.timestamp()
 }
 
 //for origin departure conversion to local time representation
-pub fn origin_departure(timestamp_text: &str, tz: &str) -> chrono::DateTime<chrono_tz::Tz> {
-    let parts = timestamp_text.split(" ").collect::<Vec<&str>>();
+pub fn origin_departure(timestamp_text: &str, tz: char) -> chrono::DateTime<chrono_tz::Tz> {
+    let naive_dt = NaiveDateTime::parse_from_str(timestamp_text, "%m/%d/%Y %l:%M:%S %p").unwrap();
 
-    let date_parts = parts[0]
-        .split("/")
-        .map(|x| x.parse::<i32>().unwrap())
-        .collect::<Vec<i32>>();
-
-    let time_parts = parts[1]
-        .split(":")
-        .map(|x| x.parse::<u8>().unwrap())
-        .collect::<Vec<u8>>();
-
-    let is_pm = parts[2] == "PM";
-
-    let native_d = NaiveDate::from_ymd_opt(
-        date_parts[2],
-        date_parts[0].try_into().unwrap(),
-        date_parts[1].try_into().unwrap(),
-    )
-    .unwrap();
-
-    //println!("{}, {:?}, {}",convert_12_to_24_hour(time_parts[0], is_pm), time_parts, parts[2]);
-    
-    let native_dt = native_d.and_hms_opt(
-        convert_12_to_24_hour(time_parts[0], is_pm).into(),
-        time_parts[1].into(),
-        time_parts[2].into(),
-    )
-    .unwrap();
-
-    let local_time_representation = tz_str_to_tz(tz)
+    let local_time_representation = tz_char_to_tz(tz)
         .unwrap()
-        .from_local_datetime(&native_dt)
+        .from_local_datetime(&naive_dt)
         .unwrap();
 
     local_time_representation
@@ -494,38 +452,13 @@ pub fn origin_departure(timestamp_text: &str, tz: &str) -> chrono::DateTime<chro
 
 //time is formatted 11/18/2023 4:58:09 PM
 pub fn process_timestamp_text(timestamp_text: &str) -> u64 {
-    let parts = timestamp_text.split(" ").collect::<Vec<&str>>();
+    let naive_dt = NaiveDateTime::parse_from_str(timestamp_text, "%m/%d/%Y %l:%M:%S %p").unwrap();
 
-    let date_parts = parts[0]
-        .split("/")
-        .map(|x| x.parse::<i32>().unwrap())
-        .collect::<Vec<i32>>();
-
-    let time_parts = parts[1]
-        .split(":")
-        .map(|x| x.parse::<u8>().unwrap())
-        .collect::<Vec<u8>>();
-
-    let is_pm = parts[2] == "PM";
-
-    let native_dt = NaiveDate::from_ymd_opt(
-        date_parts[2],
-        date_parts[0].try_into().unwrap(),
-        date_parts[1].try_into().unwrap(),
-    )
-    .unwrap()
-    .and_hms_opt(
-        convert_12_to_24_hour(time_parts[0], is_pm).into(),
-        time_parts[1].into(),
-        time_parts[2].into(),
-    )
-    .unwrap();
-
-    let newyorktime = chrono_tz::America::New_York
-        .from_local_datetime(&native_dt)
+    let eastern_time = chrono_tz::America::New_York
+        .from_local_datetime(&naive_dt)
         .unwrap();
 
-    newyorktime.timestamp().try_into().unwrap()
+    eastern_time.timestamp().try_into().unwrap()
 }
 
 pub async fn fetch_amtrak_gtfs_rt(
@@ -539,9 +472,9 @@ pub async fn fetch_amtrak_gtfs_rt(
 
     match joined_res {
         Ok(joined_res) => {
-            for feedentity in joined_res.unified_feed.entity {
-                vehicles.push(feedentity.clone());
-                trips.push(feedentity.clone());
+            for feed_entity in joined_res.unified_feed.entity {
+                vehicles.push(feed_entity.clone());
+                trips.push(feed_entity.clone());
             }
 
             Ok(GtfsAmtrakResults {
@@ -575,14 +508,14 @@ pub async fn fetch_amtrak_gtfs_rt_joined(
             let decrypted_string = amtk::decrypt(raw_data.text().await.unwrap().as_str()).unwrap();
 
             let geojson: geojson::GeoJson = decrypted_string.parse::<geojson::GeoJson>().unwrap();
-            let featurescollection: FeatureCollection =
+            let features_collection: FeatureCollection =
                 FeatureCollection::try_from(geojson).unwrap();
 
             //println!("Successfully decrypted");
             //println!("{}", decrypted_string);
             Ok(GtfsAmtrakResultsJoined {
                 unified_feed: gtfs_rt::FeedMessage {
-                    entity: featurescollection
+                    entity: features_collection
                         .features
                         .iter()
                         .map(|feature: &geojson::Feature| feature_to_gtfs_unified(&gtfs, feature))
@@ -601,11 +534,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_amtrak() {
-        let client =  reqwest::ClientBuilder::new()
-                .deflate(true)
-                .gzip(true)
-                .brotli(true)
-                .build().unwrap();
+        let client = reqwest::ClientBuilder::new()
+            .deflate(true)
+            .gzip(true)
+            .brotli(true)
+            .build()
+            .unwrap();
 
         println!("download and process amtrak gtfs file");
 
